@@ -144,3 +144,26 @@ test("duplicate runs, duplicate usage rows, and cross-issue rollouts fail instea
   await assert.rejects(() => buildReport(issue, summary(), [run([...run().usage, ...run().usage])]), /Duplicate usage row/);
   await assert.rejects(() => buildReport(issue, summary(), [], new Map([["other-run", "ignored"]])), /outside this issue/);
 });
+
+test("decision support reconciles response IDs independently of delayed cumulative usage notifications", async (t) => {
+  const first = tool("exec_command", { cmd: "cat /task/skills/demo/SKILL.md" });
+  first.payload.call_id = "a";
+  const second = tool("exec_command", { cmd: "cat /task/skills/demo/SKILL.md" }, 15);
+  second.payload.call_id = "b";
+  const path = fixture(t, [first,
+    event("token_usage_record", { response_id: "one", usage: raw() }, 12),
+    event("response_item", { type: "function_call_output", call_id: "a", output: "same document" }, 13),
+    snapshot(raw(), 14), second,
+    event("token_usage_record", { response_id: "two", usage: raw() }, 16),
+    event("response_item", { type: "function_call_output", call_id: "b", output: "same document" }, 17),
+    snapshot(raw(200, 20, 40, 20), 18),
+  ]);
+  const value = tokens(140, 20, 40, 20);
+  const report = await buildReport(issue, summary(value), [run([{ provider: "codex", model: "model-1", ...value }])], new Map([["run-1", path]]));
+  assert.equal(report.decision_support.response_count, 2);
+  assert.equal(report.decision_support.prompt_tokens, 200);
+  assert.equal(report.decision_support.prompt_coverage_percent, 100);
+  assert.equal(report.decision_support.biggest_outputs[0].next_response_line, 8);
+  assert.equal(report.decision_support.identical_read_results.length, 1);
+  assert.equal(report.decision_support.actions[0].savings_tokens, null);
+});
