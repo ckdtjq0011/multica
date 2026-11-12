@@ -1,4 +1,7 @@
-# Issue activity token usage
+# Workspace token reduction diagnostics
+
+This is workspace tooling maintained in the personal fork. The upstream project
+has not accepted it as a supported Multica CLI/server feature.
 
 Run this read-only report from a checkout with Node.js 22 and an authenticated
 Multica CLI. In an agent task, it uses the injected `MULTICA_CLI_PATH` and task
@@ -20,6 +23,49 @@ Use only local logs you are authorized to read; another runtime's files may not
 be available. There is no raw transcript export: JSON evidence contains token
 counters, models, activity labels, and source line numbers, without prompts or
 tool arguments. Local paths and run IDs remain in the JSON report.
+
+## Decide what to reduce first
+
+With a verified local rollout, the first screen ranks specific actions before
+the activity table. Each action has observed evidence, a change to make, a success
+criterion, and a guardrail. JSON's `decision_support` retains the source lines,
+large-output batches, read patterns, exact repeated-result hashes, and context
+series behind those actions.
+
+- Limit large responses before returning them to the model, especially batches
+  already being truncated. Keep the full result locally for verification.
+- For status checks, display status/revision and a description fingerprint. The
+  report compares full and projected JSON from the **same source document** in
+  the same compact encoding, so the byte reduction is inspectable. This view
+  does not replace first reading the task or verifying a description write.
+- Reuse previously read instructions in the same execution. Repeated paths show
+  candidates; they do not prove unchanged content or an unnecessary read.
+- Exact repeated content is reported only for a single recognized read with the
+  same query and result after removing transport envelopes. A fresh verification
+  can still be required; only its redundant display is a reduction candidate.
+
+The response-level records must independently reconcile to stored per-model
+usage. Duplicate response IDs are counted once. Results link to a later model
+response, never to the response that requested the tool. Older logs without
+these records keep their activity table but cannot invent decision evidence.
+
+Observed model input includes cached and uncached prompt tokens. Growth shows
+context exposure, not a causal attribution or recoverable waste. Output bytes
+are measured text volume, **never converted into billed tokens**. The 1,000-token
+context scenario assumes the same prefix persists in every model response and
+the number of responses and task outcome stay fixed; it is not a saving forecast
+and cannot price the cache/non-cache split. Action opportunities overlap and
+must not be added together as savings.
+
+For example, a status check can read the original locally and return a small view:
+
+```sh
+"$MULTICA_CLI_PATH" issue get <issue-key> --output json > issue.json
+node --input-type=module -e 'import {readFileSync} from "node:fs"; import {createHash} from "node:crypto"; const r=JSON.parse(readFileSync("issue.json")); console.log(JSON.stringify({identifier:r.identifier,status:r.status,revision:r.revision,description_sha256:createHash("sha256").update(r.description).digest("hex")}));'
+```
+
+When checking a write, also compare the saved original with the expected content
+locally and report that comparison; a fingerprint alone does not verify intent.
 
 ## Reading the result
 
@@ -72,5 +118,5 @@ before proposing smaller context reads, fewer repeated queries, or shorter
 handoff messages. The report does not estimate money or promise a saving.
 
 ```sh
-node --test scripts/issue-activity-usage.test.mjs
+node --test scripts/issue-activity-usage.test.mjs scripts/issue-usage-diagnostics.test.mjs
 ```

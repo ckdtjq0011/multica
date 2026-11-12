@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { promisify, parseArgs } from "node:util";
+import { analyzeTrace, decisionSupport, describeOperations, renderDecision } from "./issue-usage-diagnostics.mjs";
 
 export const activities = ["development", "planning", "agent_communication", "ci_check", "other_unclassified"];
 const fields = ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"];
@@ -17,16 +18,16 @@ const sum = (tokens) => fields.reduce((total, field) => total + tokens[field], 0
 const count = (value) => Number.isSafeInteger(value) && value >= 0;
 const terminal = new Set(["completed", "failed", "cancelled"]);
 
-function execActions(code) {
+function execOperations(code) {
   const tokens = code.match(/\s+|\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_$][\w$]*|[^\s]/g)
     ?.filter((token) => !/^\s|^\/\//.test(token) && !token.startsWith("/*")) ?? [];
-  if (tokens.includes("`")) return ["other_unclassified"];
+  if (tokens.includes("`")) return [{ name: "unsupported" }];
   const actions = [];
   for (let i = 0; i < tokens.length; i++) {
     if (tokens[i] !== "tools") continue;
-    if (tokens[i + 1] !== "." || tokens[i + 3] !== "(") return ["other_unclassified"];
-    if (tokens[i + 2] === "apply_patch") { actions.push("development"); continue; }
-    if (tokens[i + 2] !== "exec_command" || tokens[i + 4] !== "{") return ["other_unclassified"];
+    if (tokens[i + 1] !== "." || tokens[i + 3] !== "(") { actions.push({ name: "unsupported" }); continue; }
+    if (tokens[i + 2] === "apply_patch") { actions.push({ name: "apply_patch" }); continue; }
+    if (tokens[i + 2] !== "exec_command" || tokens[i + 4] !== "{") { actions.push({ name: "unsupported" }); continue; }
     let command;
     for (let j = i + 5; j < tokens.length && tokens[j] !== "}"; j++) {
       if (!["cmd", '"cmd"', "'cmd'"].includes(tokens[j]) || tokens[j + 1] !== ":") continue;
@@ -35,7 +36,7 @@ function execActions(code) {
       command = literal.slice(1, -1).replace(/\\([\\'"nrt])/g, (_, char) => ({ n: "\n", r: "\r", t: "\t" })[char] ?? char);
       break;
     }
-    actions.push(classifyTool("exec_command", { cmd: command }));
+    actions.push({ name: "exec_command", command });
   }
   return actions;
 }
@@ -45,7 +46,7 @@ export function classifyTool(name, input) {
   if (/^(?:functions\.)?apply_patch$/.test(name)) return "development";
   if (/^(?:functions\.)?exec$/.test(name)) {
     if (typeof input !== "string") return "other_unclassified";
-    const actions = execActions(input);
+    const actions = execOperations(input).map((operation) => classifyTool(operation.name, { cmd: operation.command }));
     return actions.length && new Set(actions).size === 1 ? actions[0] : "other_unclassified";
   }
   if (!/^(?:functions\.)?exec_command$/.test(name)) return "other_unclassified";
@@ -73,7 +74,8 @@ function normalized(raw) {
 }
 
 export async function readRollout(path, run) {
-  const result = { calls: [], warnings: [], models: {} };
+  const result = { calls: [], warnings: [], models: {}, trace: { requests: [], responses: [], results: [] } };
+  let pendingRequests = [];
   let lineNumber = 0, previous, model, meta, toolActions = [], toolLines = [];
   const start = Date.parse(run.started_at);
   // The API can serialize completion at second precision; include that whole second.
@@ -102,6 +104,17 @@ export async function readRollout(path, run) {
       }
       toolActions.push(classifyTool(payload.name ?? "", input));
       toolLines.push(lineNumber);
+      const name = (payload.name ?? "").replace(/^functions\./, "");
+      const operations = name === "exec" && typeof input === "string" ? execOperations(input) : [{ name, command: input?.cmd ?? input?.command }];
+      result.trace.requests.push({ line: lineNumber, call_id: payload.call_id, description: describeOperations(operations) });
+      pendingRequests.push(payload.call_id);
+    }
+    if (inWindow && event.type === "response_item" && ["function_call_output", "custom_tool_call_output"].includes(payload.type)) result.trace.results.push({ line: lineNumber, call_id: payload.call_id, output: payload.output });
+    if (inWindow && event.type === "token_usage_record") {
+      const raw = rawCounters(payload.usage);
+      const tokens = raw ? normalized(raw) : null;
+      if (tokens) result.trace.responses.push({ line: lineNumber, response_id: payload.response_id, model: payload.model ?? model, tokens, request_ids: pendingRequests });
+      pendingRequests = [];
     }
     if (event.type !== "event_msg" || payload.type !== "token_count" || !payload.info) continue;
     const current = rawCounters(payload.info.total_token_usage);
@@ -140,6 +153,7 @@ export async function buildReport(issue, usage, runs, rolloutPaths = new Map()) 
   const buckets = Object.fromEntries(activities.map((activity) => [activity, zero()]));
   const reports = [], seen = new Set();
   const unverifiedZeros = new Set();
+  const diagnostics = [];
   let runTotal = zero(), measuredRuns = 0;
   for (const run of runs) {
     if (seen.has(run.id)) throw new Error(`Duplicate run ${run.id}`);
@@ -150,6 +164,7 @@ export async function buildReport(issue, usage, runs, rolloutPaths = new Map()) 
     if (rolloutPaths.has(run.id)) rollout = await readRollout(rolloutPaths.get(run.id), run);
     report.rollout = rollout ? { path: rolloutPaths.get(run.id), warnings: rollout.warnings } : null;
     const seenModels = new Set();
+    const verifiedModels = new Map();
     for (const row of rows) {
       if (!fields.every((field) => count(row[field]))) throw new Error(`Incomplete usage row for run ${run.id}`);
       const key = `${row.provider}/${row.model}`;
@@ -163,6 +178,7 @@ export async function buildReport(issue, usage, runs, rolloutPaths = new Map()) 
       unverifiedZeroCounters.forEach((field) => unverifiedZeros.add(field));
       report.models.push({ provider: row.provider, model: row.model, tokens, observed_tokens: observed ?? null, unverified_zero_counters: unverifiedZeroCounters, reconciliation: matched ? "matched" : observed ? "mismatch" : "no_call_usage" });
       if (matched) {
+        verifiedModels.set(row.model, tokens);
         for (const call of rollout.calls.filter((call) => call.model === row.model)) {
           buckets[call.activity] = add(buckets[call.activity], call.tokens);
           report.evidence.push(call);
@@ -171,6 +187,7 @@ export async function buildReport(issue, usage, runs, rolloutPaths = new Map()) 
     }
     if (rows.length) { runTotal = add(runTotal, report.tokens); measuredRuns++; }
     if (!rows.length && rollout) report.live_observed_tokens = rollout.models;
+    if (rollout) diagnostics.push(analyzeTrace(rollout.trace, run.id, verifiedModels));
     reports.push(report);
   }
   for (const runID of rolloutPaths.keys()) if (!seen.has(runID)) throw new Error(`Rollout names a run outside this issue: ${runID}`);
@@ -189,6 +206,7 @@ export async function buildReport(issue, usage, runs, rolloutPaths = new Map()) 
     reconciliation: { source_vs_runs: reported ? matched ? "matched" : "mismatch" : "unreported", activities_vs_runs: measuredRuns ? equal(allocated, runTotal) ? "matched" : "mismatch" : "unreported" },
     coverage: { reported_runs: measuredRuns, unreported_terminal_runs: usage.unreported_task_count ?? null, active_runs: runs.filter((run) => !terminal.has(run.status)).length, lower_bound: unverifiedZeros.size > 0 || (usage.unreported_task_count ?? 0) > 0 || runs.some((run) => !terminal.has(run.status)) },
     activities: activities.map((activity) => ({ activity, attribution: activity === "other_unclassified" ? "unclassified" : "rule_estimate", tokens: measuredRuns ? buckets[activity] : missing(), share_percent: denominator > 0 ? 100 * sum(buckets[activity]) / denominator : null })),
+    decision_support: decisionSupport(diagnostics, matched ? source : missing(), issue),
     runs: reports.sort((a, b) => sum(b.tokens) - sum(a.tokens)),
   };
 }
@@ -197,7 +215,7 @@ export function renderTable(report) {
   const labels = ["개발", "계획", "에이전트 소통", "CI 확인", "기타/분류 불가"];
   const format = (value) => value === null ? "미보고" : value.toLocaleString("en-US");
   const counter = (value, field, uncertain) => value === 0 && uncertain && report.unverified_zero_counters.includes(field) ? "미확인(저장0)" : format(value);
-  const lines = [`${report.issue.identifier} · 해당 이슈만 · 활동은 규칙 추정`, "활동\t입력(캐시 제외)\t출력\t캐시 읽기\t캐시 쓰기\t비중"];
+  const lines = [`${report.issue.identifier} · 해당 이슈만 · 활동은 규칙 추정`, ...renderDecision(report.decision_support), "활동\t입력(캐시 제외)\t출력\t캐시 읽기\t캐시 쓰기\t비중"];
   report.activities.forEach((row, i) => lines.push([labels[i], ...fields.map((field) => counter(row.tokens[field], field, row.activity === "other_unclassified")), row.share_percent === null ? "—" : `${row.share_percent.toFixed(2)}%`].join("\t")));
   lines.push(`원천 저장 합계\t${fields.map((field) => counter(report.source_totals[field], field, true)).join("\t")}`);
   lines.push(`대조: 원천/실행 ${report.reconciliation.source_vs_runs}, 활동/실행 ${report.reconciliation.activities_vs_runs}`);
